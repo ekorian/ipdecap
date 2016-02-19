@@ -587,8 +587,46 @@ void process_nonip_packet(const u_char *payload, const int payload_len, pcap_hdr
 
   // Copy full packet
   memcpy(new_packet_payload, payload, payload_len);
-  new_packet_hdr->len = payload_len;
 }
+
+/* Decapsulate an UDP packet
+ *
+ */
+void process_udp_packet(const u_char *payload, const int payload_len, pcap_hdr *new_packet_hdr, u_char *new_packet_payload) {
+
+  int packet_size = 0;
+  const u_char *payload_src = NULL;
+  u_char *payload_dst = NULL;
+  const struct ip *ip_hdr = NULL;
+
+  payload_src = payload;
+  payload_dst = new_packet_payload;
+
+  // Copy ethernet header
+  memcpy(payload_dst, payload_src, sizeof(struct ether_header));
+  payload_src += sizeof(struct ether_header);
+  payload_dst += sizeof(struct ether_header);
+  packet_size = sizeof(struct ether_header);
+
+  // Read encapsulating IP header to find offset to encapsulted IP packet
+  ip_hdr = (const struct ip *) payload_src;
+
+  debug_print("\tIPIP: outer IP - hlen:%i iplen:%02i protocol:%02x\n",
+      (ip_hdr->ip_hl *4), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
+
+  // Shift to encapsulated IP header, read total length
+  payload_src += ip_hdr->ip_hl *4 + 8;
+  ip_hdr = (const struct ip *) payload_src;
+
+  debug_print("\tIPIP: inner IP - hlen:%i iplen:%02i protocol:%02x\n",
+      (ip_hdr->ip_hl *4 + 8), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
+
+  memcpy(payload_dst, payload_src, ntohs(ip_hdr->ip_len));
+  packet_size += ntohs(ip_hdr->ip_len);
+
+  new_packet_hdr->len = packet_size;
+}
+
 
 /* Decapsulate an IPIP packet
  *
@@ -929,6 +967,7 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
   out_pkthdr->ts.tv_sec = in_pkthdr->ts.tv_sec;
   out_pkthdr->ts.tv_usec = in_pkthdr->ts.tv_usec;
   out_pkthdr->caplen = in_pkthdr->caplen;
+  out_pkthdr->len = in_pkthdr->len;
 
   eth_hdr = (const struct ether_header *) in_payload;
 
@@ -963,7 +1002,14 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
 
     switch (ip_hdr->ip_p) {
 
-      case IPPROTO_IPIP:
+      case IPPROTO_UDP:
+         debug_print("%s\n", "\tIPPROTO_UDP");
+         process_udp_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+         //process_nonip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+         pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
+         break;
+
+      case IPPROTO_IPIP: //IPPROTO_IPV4
         debug_print("%s\n", "\tIPPROTO_IPIP");
         process_ipip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
         pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
