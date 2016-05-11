@@ -67,6 +67,19 @@ static const struct option args_long[] = {
 
 };
 
+struct ipv6_header
+{
+    unsigned int
+        version : 4,
+        traffic_class : 8,
+        flow_label : 20;
+    uint16_t length;
+    uint8_t  next_header;
+    uint8_t  hop_limit;
+    struct in6_addr src;
+    struct in6_addr dst;
+};
+
 // Global variables
 pcap_dumper_t *pcap_dumper;
 int ignore_esp;
@@ -598,6 +611,9 @@ void process_udp_packet(const u_char *payload, const int payload_len, pcap_hdr *
   const u_char *payload_src = NULL;
   u_char *payload_dst = NULL;
   const struct ip *ip_hdr = NULL;
+  const struct ipv6_header *ip6_hdr = NULL;
+  const struct	ether_header *eth_hdr = (const struct ether_header*) payload;
+  int type = ntohs(eth_hdr->ether_type);
 
   payload_src = payload;
   payload_dst = new_packet_payload;
@@ -608,23 +624,47 @@ void process_udp_packet(const u_char *payload, const int payload_len, pcap_hdr *
   payload_dst += sizeof(struct ether_header);
   packet_size = sizeof(struct ether_header);
 
-  // Read encapsulating IP header to find offset to encapsulted IP packet
-  ip_hdr = (const struct ip *) payload_src;
+  if (type == ETHERTYPE_IP) {
+     // Read encapsulating IP header to find offset to encapsulted IP packet
+     ip_hdr = (const struct ip *) payload_src;
 
-  debug_print("\tIPIP: outer IP - hlen:%i iplen:%02i protocol:%02x\n",
-      (ip_hdr->ip_hl *4), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
+     debug_print("\tIPIP: outer IP - hlen:%i iplen:%02i protocol:%02x\n",
+         (ip_hdr->ip_hl *4), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
 
-  // Shift to encapsulated IP header, read total length
-  payload_src += ip_hdr->ip_hl *4 + 8;
-  ip_hdr = (const struct ip *) payload_src;
+     // Shift to encapsulated IP header, read total length
+     payload_src += ip_hdr->ip_hl *4 + 8;  
+     ip_hdr = (const struct ip *) payload_src;
 
-  debug_print("\tIPIP: inner IP - hlen:%i iplen:%02i protocol:%02x\n",
-      (ip_hdr->ip_hl *4 + 8), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
+     debug_print("\tIPIP: inner IP - hlen:%i iplen:%02i protocol:%02x\n",
+         (ip_hdr->ip_hl *4 + 8), ntohs(ip_hdr->ip_len), ip_hdr->ip_p);
 
-  memcpy(payload_dst, payload_src, ntohs(ip_hdr->ip_len));
-  packet_size += ntohs(ip_hdr->ip_len);
+     memcpy(payload_dst, payload_src, payload_len-packet_size-(ip_hdr->ip_hl *4 + 8));
+     packet_size += ntohs(ip_hdr->ip_len);
 
-  new_packet_hdr->len = packet_size;
+     new_packet_hdr->caplen -= ip_hdr->ip_hl *4 + 8;
+     new_packet_hdr->len = packet_size;
+
+   } else if (type ==  ETHERTYPE_IPV6) {
+     // Read encapsulating IP header to find offset to encapsulted IP packet
+     ip6_hdr = (const struct ipv6_header *) payload_src;
+
+     debug_print("\tIPIP: outer IP - hlen:%i iplen:%02i protocol:%02x\n",
+        40, ntohs(ip6_hdr->length), ip6_hdr->next_header);
+
+     // Shift to encapsulated IP header, read total length
+     payload_src += 48;
+     ip6_hdr = (const struct ipv6_header *) payload_src;
+
+     debug_print("\tIPIP: inner IP - hlen:%i iplen:%02i protocol:%02x\n",
+         (48), ntohs(ip6_hdr->length), ip6_hdr->next_header);
+     //printf("%d %d");
+
+     memcpy(payload_dst, payload_src, payload_len-packet_size-48);
+     packet_size += ntohs(ip6_hdr->length);
+
+     new_packet_hdr->caplen -= 48;
+     new_packet_hdr->len = packet_size + 40;
+   } 
 }
 
 
@@ -986,7 +1026,7 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
   }
   // ethertype = *(pkt_in_ptr + 12) << 8 | *(pkt_in_ptr+13);
 
-  if (ntohs(eth_hdr->ether_type) != ETHERTYPE_IP) {
+  if (ntohs(eth_hdr->ether_type) != ETHERTYPE_IP && ntohs(eth_hdr->ether_type) !=  ETHERTYPE_IPV6) {
 
     // Non IP packet ? Just copy
     process_nonip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
@@ -994,13 +1034,20 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
 
   } else {
 
+    int proto = 0;
     // Find encapsulation type
-    ip_hdr = (const struct ip *) (in_payload + sizeof(struct ether_header));
-
+    if (ntohs(eth_hdr->ether_type) == ETHERTYPE_IP) {
+       ip_hdr = (const struct ip *) (in_payload + sizeof(struct ether_header));
+       proto = ip_hdr->ip_p;
+    } else if (ntohs(eth_hdr->ether_type) == ETHERTYPE_IPV6) {
+       const struct ipv6_header * ip6_hdr = (const struct ipv6_header *) (in_payload + sizeof(struct ether_header));
+       proto = ip6_hdr->next_header;
+    } 
+     
     //debug_print("\tIP hlen:%i iplen:%02x protocol:%02x payload_len:%i\n",
       //(ip_hdr->ip_hl *4), ntohs(ip_hdr->ip_len), ip_hdr->ip_p, payload_len);
 
-    switch (ip_hdr->ip_p) {
+    switch (proto) {
 
       case IPPROTO_UDP:
          debug_print("%s\n", "\tIPPROTO_UDP");
@@ -1017,7 +1064,8 @@ void handle_packets(u_char *bpf_filter, const struct pcap_pkthdr *pkthdr, const 
 
       case IPPROTO_IPV6:
         debug_print("%s\n", "\tIPPROTO_IPV6");
-        process_ipv6_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+        //process_ipv6_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
+        process_nonip_packet(in_payload, in_pkthdr->caplen, out_pkthdr, out_payload);
         pcap_dump((u_char *)pcap_dumper, out_pkthdr, out_payload);
         break;
 
